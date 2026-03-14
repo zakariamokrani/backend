@@ -1,17 +1,38 @@
 # backend/main.py
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 import uuid
 from datetime import datetime
+import os
+import logging
+import sys
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.dialects.postgresql import UUID
+import time
 
+# --------- Logging Setup ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
+
+logger.info("=" * 50)
+logger.info("Starting Course Management API...")
+logger.info("=" * 50)
+
+# --------- FastAPI App ----------
 app = FastAPI(
     title="Course Management API",
     description="API for managing courses, specialities, years, modules and files",
     version="1.0.0"
 )
 
-# Allow CORS from your Flutter app
+# --------- CORS Middleware ----------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,382 +41,839 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------- In-Memory Databases ----------
-specialities_db = []
-years_db = []
-modules_db = []
-files_db = []
+# --------- Database Setup with Retry Logic ----------
+logger.info("Setting up database connection...")
+
+# Get database URL from Railway environment
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # Mask password for logging
+    masked_url = DATABASE_URL
+    if '@' in DATABASE_URL:
+        parts = DATABASE_URL.split('@')
+        credentials = parts[0].split(':')
+        if len(credentials) > 2:
+            masked_url = f"{credentials[0]}:********@{parts[1]}"
+    logger.info(f"DATABASE_URL found: {masked_url}")
+    
+    # Fix for Postgres URL format
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        logger.info("Fixed postgres:// to postgresql:// URL format")
+else:
+    logger.warning("No DATABASE_URL found, using SQLite fallback")
+    DATABASE_URL = "sqlite:///./test.db"
+
+# Create engine with connection pooling for better reliability
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,  # Verify connections before using
+    echo=False  # Set to True for SQL debugging
+)
+
+# Test database connection with retries
+max_retries = 5
+retry_count = 0
+db_connected = False
+
+while retry_count < max_retries and not db_connected:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            logger.info("✅ Database connection successful!")
+            db_connected = True
+    except Exception as e:
+        retry_count += 1
+        logger.error(f"❌ Database connection attempt {retry_count} failed: {e}")
+        if retry_count < max_retries:
+            logger.info(f"Retrying in 5 seconds...")
+            time.sleep(5)
+        else:
+            logger.error("⚠️ Max retries reached. Continuing without database connection.")
+            logger.error("The app will start but database operations will fail until connection is restored.")
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --------- Database Models ----------
+class SpecialityDB(Base):
+    __tablename__ = "specialities"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    icon = Column(String, nullable=False)
+    color = Column(String, nullable=False)
+
+class YearDB(Base):
+    __tablename__ = "years"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    specialityId = Column(Integer, nullable=False)
+    name = Column(String, nullable=False)
+
+class ModuleDB(Base):
+    __tablename__ = "modules"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    yearId = Column(Integer, nullable=False)
+    name = Column(String, nullable=False)
+    icon = Column(String, nullable=False)
+
+class FileDB(Base):
+    __tablename__ = "files"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    moduleId = Column(Integer, nullable=False)
+    filename = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    fileUrl = Column(String, nullable=False)
+    iconName = Column(String, nullable=True)
+    colorValue = Column(String, nullable=True)
+    createdAt = Column(DateTime, default=datetime.now)
+
+# Create tables
+try:
+    logger.info("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("✅ Tables created successfully!")
+except Exception as e:
+    logger.error(f"❌ Failed to create tables: {e}")
+
+# --------- Dependency to get DB session ----------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception as e:
+        logger.error(f"Database session error: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 # --------- Helper Functions ----------
-def get_next_id(db_list):
-    if not db_list:
+def get_next_id(db, model):
+    """Get next ID for a model"""
+    try:
+        result = db.query(model).order_by(model.id.desc()).first()
+        if result:
+            return result.id + 1
         return 1
-    return max(item["id"] for item in db_list) + 1
+    except Exception as e:
+        logger.error(f"Error getting next ID: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 # --------- Speciality Endpoints ----------
-@app.post(
-    "/specialities", 
-    status_code=201,
-    summary="Create a new speciality",
-    description="Create a speciality by providing name, icon URL, and color"
-)
+@app.post("/specialities", status_code=201)
 async def create_speciality(
     name: str = Form(..., description="Name of the speciality"),
     icon: str = Form(..., description="URL of the icon image"),
-    color: str = Form(..., description="Color code in hex format")
+    color: str = Form(..., description="Color code in hex format"),
+    db: Session = Depends(get_db)
 ):
-    """Create a new speciality - you provide name, icon, color - server generates ID"""
-    new_speciality = {
-        "id": get_next_id(specialities_db),
-        "name": name,
-        "icon": icon,
-        "color": color
-    }
-    specialities_db.append(new_speciality)
-    return new_speciality
+    """Create a new speciality"""
+    try:
+        new_id = get_next_id(db, SpecialityDB)
+        new_speciality = SpecialityDB(
+            id=new_id,
+            name=name,
+            icon=icon,
+            color=color
+        )
+        db.add(new_speciality)
+        db.commit()
+        db.refresh(new_speciality)
+        logger.info(f"Created speciality: {name} (ID: {new_id})")
+        return {
+            "id": new_speciality.id,
+            "name": new_speciality.name,
+            "icon": new_speciality.icon,
+            "color": new_speciality.color
+        }
+    except Exception as e:
+        logger.error(f"Error creating speciality: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/specialities", response_model=List[dict])
-async def get_specialities():
+async def get_specialities(db: Session = Depends(get_db)):
     """Get all specialities"""
-    return specialities_db
+    try:
+        specialities = db.query(SpecialityDB).all()
+        return [
+            {
+                "id": s.id,
+                "name": s.name,
+                "icon": s.icon,
+                "color": s.color
+            }
+            for s in specialities
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching specialities: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/specialities/{speciality_id}", response_model=dict)
-async def get_speciality(speciality_id: int):
+@app.get("/specialities/{speciality_id}")
+async def get_speciality(speciality_id: int, db: Session = Depends(get_db)):
     """Get a specific speciality by ID"""
-    speciality = next((s for s in specialities_db if s["id"] == speciality_id), None)
-    if not speciality:
-        raise HTTPException(status_code=404, detail="Speciality not found")
-    return speciality
+    try:
+        speciality = db.query(SpecialityDB).filter(SpecialityDB.id == speciality_id).first()
+        if not speciality:
+            raise HTTPException(status_code=404, detail="Speciality not found")
+        return {
+            "id": speciality.id,
+            "name": speciality.name,
+            "icon": speciality.icon,
+            "color": speciality.color
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching speciality {speciality_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.put("/specialities/{speciality_id}")
 async def update_speciality(
     speciality_id: int,
-    name: str = Form(..., description="Name of the speciality"),
-    icon: str = Form(..., description="URL of the icon image"),
-    color: str = Form(..., description="Color code in hex format")
+    name: str = Form(...),
+    icon: str = Form(...),
+    color: str = Form(...),
+    db: Session = Depends(get_db)
 ):
     """Update an existing speciality"""
-    index = next((i for i, s in enumerate(specialities_db) if s["id"] == speciality_id), None)
-    if index is None:
-        raise HTTPException(status_code=404, detail="Speciality not found")
-    
-    updated_speciality = {
-        "id": speciality_id,
-        "name": name,
-        "icon": icon,
-        "color": color
-    }
-    specialities_db[index] = updated_speciality
-    return updated_speciality
+    try:
+        speciality = db.query(SpecialityDB).filter(SpecialityDB.id == speciality_id).first()
+        if not speciality:
+            raise HTTPException(status_code=404, detail="Speciality not found")
+        
+        speciality.name = name
+        speciality.icon = icon
+        speciality.color = color
+        db.commit()
+        db.refresh(speciality)
+        logger.info(f"Updated speciality: {name} (ID: {speciality_id})")
+        
+        return {
+            "id": speciality.id,
+            "name": speciality.name,
+            "icon": speciality.icon,
+            "color": speciality.color
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating speciality {speciality_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.delete("/specialities/{speciality_id}")
-async def delete_speciality(speciality_id: int):
+async def delete_speciality(speciality_id: int, db: Session = Depends(get_db)):
     """Delete a speciality"""
-    global specialities_db, years_db, modules_db, files_db
-    
-    speciality = next((s for s in specialities_db if s["id"] == speciality_id), None)
-    if not speciality:
-        raise HTTPException(status_code=404, detail="Speciality not found")
-    
-    # Delete all related data
-    years_to_delete = [y for y in years_db if y["specialityId"] == speciality_id]
-    for year in years_to_delete:
-        modules_to_delete = [m for m in modules_db if m["yearId"] == year["id"]]
-        for module in modules_to_delete:
-            files_db = [f for f in files_db if f["moduleId"] != module["id"]]
-        modules_db = [m for m in modules_db if m["yearId"] != year["id"]]
-    years_db = [y for y in years_db if y["specialityId"] != speciality_id]
-    specialities_db = [s for s in specialities_db if s["id"] != speciality_id]
-    
-    return {"message": "Speciality and all related data deleted successfully"}
+    try:
+        speciality = db.query(SpecialityDB).filter(SpecialityDB.id == speciality_id).first()
+        if not speciality:
+            raise HTTPException(status_code=404, detail="Speciality not found")
+        
+        # Delete related data (cascade manually)
+        db.query(YearDB).filter(YearDB.specialityId == speciality_id).delete()
+        db.delete(speciality)
+        db.commit()
+        logger.info(f"Deleted speciality ID: {speciality_id}")
+        
+        return {"message": "Speciality and all related data deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting speciality {speciality_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # --------- Year Endpoints ----------
-@app.get("/years", response_model=List[dict])
-async def get_all_years():
-    """Get all years across all specialities"""
-    return years_db
-
-@app.post(
-    "/years", 
-    status_code=201,
-    summary="Create a new year",
-    description="Create a year by providing specialityId and name"
-)
+@app.post("/years", status_code=201)
 async def create_year(
-    specialityId: int = Form(..., description="ID of the speciality this year belongs to"),
-    name: str = Form(..., description="Year name (L1, L2, L3, M1, M2)")
+    specialityId: int = Form(...),
+    name: str = Form(...),
+    db: Session = Depends(get_db)
 ):
-    """Create a new year - you provide specialityId and name - server generates ID"""
-    speciality = next((s for s in specialities_db if s["id"] == specialityId), None)
-    if not speciality:
-        raise HTTPException(status_code=404, detail=f"Speciality with id {specialityId} not found")
-    
-    new_year = {
-        "id": get_next_id(years_db),
-        "specialityId": specialityId,
-        "name": name
-    }
-    years_db.append(new_year)
-    return new_year
+    """Create a new year"""
+    try:
+        # Verify speciality exists
+        speciality = db.query(SpecialityDB).filter(SpecialityDB.id == specialityId).first()
+        if not speciality:
+            raise HTTPException(status_code=404, detail=f"Speciality with id {specialityId} not found")
+        
+        new_id = get_next_id(db, YearDB)
+        new_year = YearDB(
+            id=new_id,
+            specialityId=specialityId,
+            name=name
+        )
+        db.add(new_year)
+        db.commit()
+        db.refresh(new_year)
+        logger.info(f"Created year: {name} for speciality {specialityId} (ID: {new_id})")
+        return {
+            "id": new_year.id,
+            "specialityId": new_year.specialityId,
+            "name": new_year.name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating year: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/years", response_model=List[dict])
+async def get_all_years(db: Session = Depends(get_db)):
+    """Get all years across all specialities"""
+    try:
+        years = db.query(YearDB).all()
+        return [
+            {
+                "id": y.id,
+                "specialityId": y.specialityId,
+                "name": y.name
+            }
+            for y in years
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching years: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/specialities/{speciality_id}/years", response_model=List[dict])
-async def get_years_by_speciality(speciality_id: int):
+async def get_years_by_speciality(speciality_id: int, db: Session = Depends(get_db)):
     """Get all years for a specific speciality"""
-    return [y for y in years_db if y["specialityId"] == speciality_id]
+    try:
+        years = db.query(YearDB).filter(YearDB.specialityId == speciality_id).all()
+        return [
+            {
+                "id": y.id,
+                "specialityId": y.specialityId,
+                "name": y.name
+            }
+            for y in years
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching years for speciality {speciality_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/years/{year_id}", response_model=dict)
-async def get_year(year_id: int):
+@app.get("/years/{year_id}")
+async def get_year(year_id: int, db: Session = Depends(get_db)):
     """Get a specific year by ID"""
-    year = next((y for y in years_db if y["id"] == year_id), None)
-    if not year:
-        raise HTTPException(status_code=404, detail="Year not found")
-    return year
+    try:
+        year = db.query(YearDB).filter(YearDB.id == year_id).first()
+        if not year:
+            raise HTTPException(status_code=404, detail="Year not found")
+        return {
+            "id": year.id,
+            "specialityId": year.specialityId,
+            "name": year.name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching year {year_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.put("/years/{year_id}")
 async def update_year(
     year_id: int,
-    specialityId: int = Form(..., description="ID of the speciality this year belongs to"),
-    name: str = Form(..., description="Year name (L1, L2, L3, M1, M2)")
+    specialityId: int = Form(...),
+    name: str = Form(...),
+    db: Session = Depends(get_db)
 ):
     """Update an existing year"""
-    index = next((i for i, y in enumerate(years_db) if y["id"] == year_id), None)
-    if index is None:
-        raise HTTPException(status_code=404, detail="Year not found")
-    
-    speciality = next((s for s in specialities_db if s["id"] == specialityId), None)
-    if not speciality:
-        raise HTTPException(status_code=404, detail=f"Speciality with id {specialityId} not found")
-    
-    updated_year = {
-        "id": year_id,
-        "specialityId": specialityId,
-        "name": name
-    }
-    years_db[index] = updated_year
-    return updated_year
+    try:
+        year = db.query(YearDB).filter(YearDB.id == year_id).first()
+        if not year:
+            raise HTTPException(status_code=404, detail="Year not found")
+        
+        # Verify speciality exists
+        speciality = db.query(SpecialityDB).filter(SpecialityDB.id == specialityId).first()
+        if not speciality:
+            raise HTTPException(status_code=404, detail=f"Speciality with id {specialityId} not found")
+        
+        year.specialityId = specialityId
+        year.name = name
+        db.commit()
+        db.refresh(year)
+        logger.info(f"Updated year ID: {year_id}")
+        
+        return {
+            "id": year.id,
+            "specialityId": year.specialityId,
+            "name": year.name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating year {year_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.delete("/years/{year_id}")
-async def delete_year(year_id: int):
+async def delete_year(year_id: int, db: Session = Depends(get_db)):
     """Delete a year"""
-    global years_db, modules_db, files_db
-    
-    year = next((y for y in years_db if y["id"] == year_id), None)
-    if not year:
-        raise HTTPException(status_code=404, detail="Year not found")
-    
-    # Delete all related modules and files
-    modules_to_delete = [m for m in modules_db if m["yearId"] == year_id]
-    for module in modules_to_delete:
-        files_db = [f for f in files_db if f["moduleId"] != module["id"]]
-    modules_db = [m for m in modules_db if m["yearId"] != year_id]
-    years_db = [y for y in years_db if y["id"] != year_id]
-    
-    return {"message": "Year and all related modules/files deleted successfully"}
+    try:
+        year = db.query(YearDB).filter(YearDB.id == year_id).first()
+        if not year:
+            raise HTTPException(status_code=404, detail="Year not found")
+        
+        # Delete related modules and files
+        modules = db.query(ModuleDB).filter(ModuleDB.yearId == year_id).all()
+        for module in modules:
+            db.query(FileDB).filter(FileDB.moduleId == module.id).delete()
+        db.query(ModuleDB).filter(ModuleDB.yearId == year_id).delete()
+        db.delete(year)
+        db.commit()
+        logger.info(f"Deleted year ID: {year_id}")
+        
+        return {"message": "Year and all related modules/files deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting year {year_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # --------- Module Endpoints ----------
-@app.get("/modules", response_model=List[dict])
-async def get_all_modules():
-    """Get all modules across all years"""
-    return modules_db
-
-@app.post(
-    "/modules", 
-    status_code=201,
-    summary="Create a new module",
-    description="Create a module by providing yearId, name, and icon URL"
-)
+@app.post("/modules", status_code=201)
 async def create_module(
-    yearId: int = Form(..., description="ID of the year this module belongs to"),
-    name: str = Form(..., description="Name of the module"),
-    icon: str = Form(..., description="URL of the module icon")
+    yearId: int = Form(...),
+    name: str = Form(...),
+    icon: str = Form(...),
+    db: Session = Depends(get_db)
 ):
-    """Create a new module - you provide yearId, name, icon - server generates ID"""
-    year = next((y for y in years_db if y["id"] == yearId), None)
-    if not year:
-        raise HTTPException(status_code=404, detail=f"Year with id {yearId} not found")
-    
-    new_module = {
-        "id": get_next_id(modules_db),
-        "yearId": yearId,
-        "name": name,
-        "icon": icon
-    }
-    modules_db.append(new_module)
-    return new_module
+    """Create a new module"""
+    try:
+        # Verify year exists
+        year = db.query(YearDB).filter(YearDB.id == yearId).first()
+        if not year:
+            raise HTTPException(status_code=404, detail=f"Year with id {yearId} not found")
+        
+        new_id = get_next_id(db, ModuleDB)
+        new_module = ModuleDB(
+            id=new_id,
+            yearId=yearId,
+            name=name,
+            icon=icon
+        )
+        db.add(new_module)
+        db.commit()
+        db.refresh(new_module)
+        logger.info(f"Created module: {name} for year {yearId} (ID: {new_id})")
+        return {
+            "id": new_module.id,
+            "yearId": new_module.yearId,
+            "name": new_module.name,
+            "icon": new_module.icon
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating module: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/modules", response_model=List[dict])
+async def get_all_modules(db: Session = Depends(get_db)):
+    """Get all modules across all years"""
+    try:
+        modules = db.query(ModuleDB).all()
+        return [
+            {
+                "id": m.id,
+                "yearId": m.yearId,
+                "name": m.name,
+                "icon": m.icon
+            }
+            for m in modules
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching modules: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/years/{year_id}/modules", response_model=List[dict])
-async def get_modules_by_year(year_id: int):
+async def get_modules_by_year(year_id: int, db: Session = Depends(get_db)):
     """Get all modules for a specific year"""
-    return [m for m in modules_db if m["yearId"] == year_id]
+    try:
+        modules = db.query(ModuleDB).filter(ModuleDB.yearId == year_id).all()
+        return [
+            {
+                "id": m.id,
+                "yearId": m.yearId,
+                "name": m.name,
+                "icon": m.icon
+            }
+            for m in modules
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching modules for year {year_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/modules/{module_id}", response_model=dict)
-async def get_module(module_id: int):
+@app.get("/modules/{module_id}")
+async def get_module(module_id: int, db: Session = Depends(get_db)):
     """Get a specific module by ID"""
-    module = next((m for m in modules_db if m["id"] == module_id), None)
-    if not module:
-        raise HTTPException(status_code=404, detail="Module not found")
-    return module
+    try:
+        module = db.query(ModuleDB).filter(ModuleDB.id == module_id).first()
+        if not module:
+            raise HTTPException(status_code=404, detail="Module not found")
+        return {
+            "id": module.id,
+            "yearId": module.yearId,
+            "name": module.name,
+            "icon": module.icon
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching module {module_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.put("/modules/{module_id}")
 async def update_module(
     module_id: int,
-    yearId: int = Form(..., description="ID of the year this module belongs to"),
-    name: str = Form(..., description="Name of the module"),
-    icon: str = Form(..., description="URL of the module icon")
+    yearId: int = Form(...),
+    name: str = Form(...),
+    icon: str = Form(...),
+    db: Session = Depends(get_db)
 ):
     """Update an existing module"""
-    index = next((i for i, m in enumerate(modules_db) if m["id"] == module_id), None)
-    if index is None:
-        raise HTTPException(status_code=404, detail="Module not found")
-    
-    year = next((y for y in years_db if y["id"] == yearId), None)
-    if not year:
-        raise HTTPException(status_code=404, detail=f"Year with id {yearId} not found")
-    
-    updated_module = {
-        "id": module_id,
-        "yearId": yearId,
-        "name": name,
-        "icon": icon
-    }
-    modules_db[index] = updated_module
-    return updated_module
+    try:
+        module = db.query(ModuleDB).filter(ModuleDB.id == module_id).first()
+        if not module:
+            raise HTTPException(status_code=404, detail="Module not found")
+        
+        # Verify year exists
+        year = db.query(YearDB).filter(YearDB.id == yearId).first()
+        if not year:
+            raise HTTPException(status_code=404, detail=f"Year with id {yearId} not found")
+        
+        module.yearId = yearId
+        module.name = name
+        module.icon = icon
+        db.commit()
+        db.refresh(module)
+        logger.info(f"Updated module ID: {module_id}")
+        
+        return {
+            "id": module.id,
+            "yearId": module.yearId,
+            "name": module.name,
+            "icon": module.icon
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating module {module_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.delete("/modules/{module_id}")
-async def delete_module(module_id: int):
+async def delete_module(module_id: int, db: Session = Depends(get_db)):
     """Delete a module"""
-    global modules_db, files_db
-    
-    module = next((m for m in modules_db if m["id"] == module_id), None)
-    if not module:
-        raise HTTPException(status_code=404, detail="Module not found")
-    
-    # Delete all related files
-    files_db = [f for f in files_db if f["moduleId"] != module_id]
-    modules_db = [m for m in modules_db if m["id"] != module_id]
-    
-    return {"message": "Module and all related files deleted successfully"}
+    try:
+        module = db.query(ModuleDB).filter(ModuleDB.id == module_id).first()
+        if not module:
+            raise HTTPException(status_code=404, detail="Module not found")
+        
+        # Delete related files
+        db.query(FileDB).filter(FileDB.moduleId == module_id).delete()
+        db.delete(module)
+        db.commit()
+        logger.info(f"Deleted module ID: {module_id}")
+        
+        return {"message": "Module and all related files deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting module {module_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # --------- File Endpoints ----------
-@app.get("/files", response_model=List[dict])
-async def get_all_files():
-    """Get all files across all modules"""
-    return files_db
-
-@app.post(
-    "/files", 
-    status_code=201,
-    summary="Create a new file",
-    description="Create a file by providing moduleId, filename, title, fileUrl, and optional iconName and colorValue"
-)
+@app.post("/files", status_code=201)
 async def create_file(
-    moduleId: int = Form(..., description="ID of the module this file belongs to"),
-    filename: str = Form(..., description="Name of the file"),
-    title: str = Form(..., description="Type of content (Course, TD, or TP)"),
-    fileUrl: str = Form(..., description="URL where the file is stored"),
-    iconName: Optional[str] = Form(None, description="Icon name for the file"),
-    colorValue: Optional[str] = Form(None, description="Color value for the file")
+    moduleId: int = Form(...),
+    filename: str = Form(...),
+    title: str = Form(...),
+    fileUrl: str = Form(...),
+    iconName: Optional[str] = Form(None),
+    colorValue: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
 ):
-    """Create a new file - you provide moduleId, filename, title, fileUrl - server generates ID"""
-    module = next((m for m in modules_db if m["id"] == moduleId), None)
-    if not module:
-        raise HTTPException(status_code=404, detail=f"Module with id {moduleId} not found")
-    
-    new_file = {
-        "id": str(uuid.uuid4()),
-        "moduleId": moduleId,
-        "filename": filename,
-        "title": title,
-        "fileUrl": fileUrl,
-        "iconName": iconName,
-        "colorValue": colorValue,
-        "createdAt": datetime.now()
-    }
-    files_db.append(new_file)
-    return new_file
+    """Create a new file"""
+    try:
+        # Verify module exists
+        module = db.query(ModuleDB).filter(ModuleDB.id == moduleId).first()
+        if not module:
+            raise HTTPException(status_code=404, detail=f"Module with id {moduleId} not found")
+        
+        new_file = FileDB(
+            id=uuid.uuid4(),
+            moduleId=moduleId,
+            filename=filename,
+            title=title,
+            fileUrl=fileUrl,
+            iconName=iconName,
+            colorValue=colorValue,
+            createdAt=datetime.now()
+        )
+        db.add(new_file)
+        db.commit()
+        db.refresh(new_file)
+        logger.info(f"Created file: {filename} for module {moduleId}")
+        
+        return {
+            "id": str(new_file.id),
+            "moduleId": new_file.moduleId,
+            "filename": new_file.filename,
+            "title": new_file.title,
+            "fileUrl": new_file.fileUrl,
+            "iconName": new_file.iconName,
+            "colorValue": new_file.colorValue,
+            "createdAt": new_file.createdAt
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating file: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/files", response_model=List[dict])
+async def get_all_files(db: Session = Depends(get_db)):
+    """Get all files across all modules"""
+    try:
+        files = db.query(FileDB).all()
+        return [
+            {
+                "id": str(f.id),
+                "moduleId": f.moduleId,
+                "filename": f.filename,
+                "title": f.title,
+                "fileUrl": f.fileUrl,
+                "iconName": f.iconName,
+                "colorValue": f.colorValue,
+                "createdAt": f.createdAt
+            }
+            for f in files
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching files: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/modules/{module_id}/files", response_model=List[dict])
-async def get_files_by_module(module_id: int):
+async def get_files_by_module(module_id: int, db: Session = Depends(get_db)):
     """Get all files for a specific module"""
-    return [f for f in files_db if f["moduleId"] == module_id]
+    try:
+        files = db.query(FileDB).filter(FileDB.moduleId == module_id).all()
+        return [
+            {
+                "id": str(f.id),
+                "moduleId": f.moduleId,
+                "filename": f.filename,
+                "title": f.title,
+                "fileUrl": f.fileUrl,
+                "iconName": f.iconName,
+                "colorValue": f.colorValue,
+                "createdAt": f.createdAt
+            }
+            for f in files
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching files for module {module_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/modules/{module_id}/titles/{title}/files", response_model=List[dict])
-async def get_files_by_title(module_id: int, title: str):
+async def get_files_by_title(module_id: int, title: str, db: Session = Depends(get_db)):
     """Get files for a specific module and title"""
-    return [f for f in files_db if f["moduleId"] == module_id and f["title"] == title]
+    try:
+        files = db.query(FileDB).filter(
+            FileDB.moduleId == module_id,
+            FileDB.title == title
+        ).all()
+        return [
+            {
+                "id": str(f.id),
+                "moduleId": f.moduleId,
+                "filename": f.filename,
+                "title": f.title,
+                "fileUrl": f.fileUrl,
+                "iconName": f.iconName,
+                "colorValue": f.colorValue,
+                "createdAt": f.createdAt
+            }
+            for f in files
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching files for module {module_id} and title {title}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/files/{file_id}", response_model=dict)
-async def get_file(file_id: str):
+@app.get("/files/{file_id}")
+async def get_file(file_id: str, db: Session = Depends(get_db)):
     """Get a specific file by ID"""
-    file = next((f for f in files_db if f["id"] == file_id), None)
-    if not file:
-        raise HTTPException(status_code=404, detail="File not found")
-    return file
+    try:
+        try:
+            file_uuid = uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid file ID format")
+        
+        file = db.query(FileDB).filter(FileDB.id == file_uuid).first()
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        return {
+            "id": str(file.id),
+            "moduleId": file.moduleId,
+            "filename": file.filename,
+            "title": file.title,
+            "fileUrl": file.fileUrl,
+            "iconName": file.iconName,
+            "colorValue": file.colorValue,
+            "createdAt": file.createdAt
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching file {file_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.put("/files/{file_id}")
 async def update_file(
     file_id: str,
-    moduleId: int = Form(..., description="ID of the module this file belongs to"),
-    filename: str = Form(..., description="Name of the file"),
-    title: str = Form(..., description="Type of content (Course, TD, or TP)"),
-    fileUrl: str = Form(..., description="URL where the file is stored"),
-    iconName: Optional[str] = Form(None, description="Icon name for the file"),
-    colorValue: Optional[str] = Form(None, description="Color value for the file")
+    moduleId: int = Form(...),
+    filename: str = Form(...),
+    title: str = Form(...),
+    fileUrl: str = Form(...),
+    iconName: Optional[str] = Form(None),
+    colorValue: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
 ):
     """Update an existing file"""
-    index = next((i for i, f in enumerate(files_db) if f["id"] == file_id), None)
-    if index is None:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    module = next((m for m in modules_db if m["id"] == moduleId), None)
-    if not module:
-        raise HTTPException(status_code=404, detail=f"Module with id {moduleId} not found")
-    
-    updated_file = {
-        "id": file_id,
-        "moduleId": moduleId,
-        "filename": filename,
-        "title": title,
-        "fileUrl": fileUrl,
-        "iconName": iconName,
-        "colorValue": colorValue,
-        "createdAt": files_db[index]["createdAt"]
-    }
-    files_db[index] = updated_file
-    return updated_file
+    try:
+        try:
+            file_uuid = uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid file ID format")
+        
+        file = db.query(FileDB).filter(FileDB.id == file_uuid).first()
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Verify module exists
+        module = db.query(ModuleDB).filter(ModuleDB.id == moduleId).first()
+        if not module:
+            raise HTTPException(status_code=404, detail=f"Module with id {moduleId} not found")
+        
+        file.moduleId = moduleId
+        file.filename = filename
+        file.title = title
+        file.fileUrl = fileUrl
+        file.iconName = iconName
+        file.colorValue = colorValue
+        db.commit()
+        db.refresh(file)
+        logger.info(f"Updated file ID: {file_id}")
+        
+        return {
+            "id": str(file.id),
+            "moduleId": file.moduleId,
+            "filename": file.filename,
+            "title": file.title,
+            "fileUrl": file.fileUrl,
+            "iconName": file.iconName,
+            "colorValue": file.colorValue,
+            "createdAt": file.createdAt
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating file {file_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.delete("/files/{file_id}")
-async def delete_file(file_id: str):
+async def delete_file(file_id: str, db: Session = Depends(get_db)):
     """Delete a file"""
-    global files_db
-    
-    file = next((f for f in files_db if f["id"] == file_id), None)
-    if not file:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    files_db = [f for f in files_db if f["id"] != file_id]
-    return {"message": "File deleted successfully"}
+    try:
+        try:
+            file_uuid = uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid file ID format")
+        
+        file = db.query(FileDB).filter(FileDB.id == file_uuid).first()
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        db.delete(file)
+        db.commit()
+        logger.info(f"Deleted file ID: {file_id}")
+        
+        return {"message": "File deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting file {file_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # --------- Utility Endpoints ----------
 @app.get("/modules/{module_id}/titles")
-async def get_unique_titles(module_id: int):
+async def get_unique_titles(module_id: int, db: Session = Depends(get_db)):
     """Get unique titles for a specific module"""
-    titles = set()
-    for file in files_db:
-        if file["moduleId"] == module_id and file.get("title"):
-            titles.add(file["title"])
-    return sorted(list(titles))
+    try:
+        titles = db.query(FileDB.title).filter(FileDB.moduleId == module_id).distinct().all()
+        return [title[0] for title in titles]
+    except Exception as e:
+        logger.error(f"Error fetching titles for module {module_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now()}
+    """Simple health check for Railway - always returns 200"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "Course Management API",
+        "database_url_configured": "Yes" if os.getenv("DATABASE_URL") else "No"
+    }
+
+@app.get("/health/db")
+async def health_check_db(db: Session = Depends(get_db)):
+    """Detailed health check with database status"""
+    try:
+        db.execute(text("SELECT 1")).first()
+        db_status = "connected"
+        overall_status = "healthy"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+        overall_status = "degraded"
+    
+    return {
+        "status": overall_status,
+        "timestamp": datetime.now().isoformat(),
+        "database": db_status,
+        "service": "Course Management API"
+    }
 
 @app.get("/")
 async def root():
     return {
-        "message": "Course Management API is running", 
+        "message": "Course Management API is running with PostgreSQL", 
         "status": "ok",
         "documentation": "/docs",
+        "health_check": {
+            "basic": "/health",
+            "with_db": "/health/db"
+        },
+        "environment": {
+            "database_configured": "Yes" if os.getenv("DATABASE_URL") else "No",
+            "python_version": sys.version.split()[0]
+        },
         "endpoints": {
             "specialities": {
                 "get_all": "GET /specialities",
@@ -431,5 +909,3 @@ async def root():
             }
         }
     }
-
-# Run with: uvicorn main:app --reload
