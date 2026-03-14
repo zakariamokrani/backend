@@ -133,6 +133,7 @@ class FileDB(Base):
     iconName = Column(String, nullable=True)
     colorValue = Column(String, nullable=True)
     createdAt = Column(DateTime, default=datetime.now)
+    grouped = Column(String, nullable=False, default="files")
 
 # Create tables
 try:
@@ -276,7 +277,17 @@ async def delete_speciality(speciality_id: int, db: Session = Depends(get_db)):
         if not speciality:
             raise HTTPException(status_code=404, detail="Speciality not found")
         
-        # Delete related data (cascade manually)
+        # Get all years for this speciality
+        years = db.query(YearDB).filter(YearDB.specialityId == speciality_id).all()
+        
+        # For each year, get modules and delete their files
+        for year in years:
+            modules = db.query(ModuleDB).filter(ModuleDB.yearId == year.id).all()
+            for module in modules:
+                db.query(FileDB).filter(FileDB.moduleId == module.id).delete()
+            db.query(ModuleDB).filter(ModuleDB.yearId == year.id).delete()
+        
+        # Delete years and speciality
         db.query(YearDB).filter(YearDB.specialityId == speciality_id).delete()
         db.delete(speciality)
         db.commit()
@@ -422,11 +433,15 @@ async def delete_year(year_id: int, db: Session = Depends(get_db)):
         if not year:
             raise HTTPException(status_code=404, detail="Year not found")
         
-        # Delete related modules and files
+        # Get modules for this year
         modules = db.query(ModuleDB).filter(ModuleDB.yearId == year_id).all()
+        
+        # Delete files for each module, then delete modules
         for module in modules:
             db.query(FileDB).filter(FileDB.moduleId == module.id).delete()
         db.query(ModuleDB).filter(ModuleDB.yearId == year_id).delete()
+        
+        # Delete year
         db.delete(year)
         db.commit()
         logger.info(f"Deleted year ID: {year_id}")
@@ -595,18 +610,16 @@ async def delete_module(module_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # --------- File Endpoints ----------
-<<<<<<< HEAD
 @app.post("/files", status_code=201)
 async def create_file(
     moduleId: int = Form(...),
     filename: str = Form(...),
     title: str = Form(...),
     fileUrl: str = Form(...),
-    iconName: Optional[str] = Form(None),
-    colorValue: Optional[str] = Form(None),
+    grouped: str = Form("files"),
     db: Session = Depends(get_db)
 ):
-    """Create a new file"""
+    """Create a new file (iconName and colorValue removed)"""
     try:
         # Verify module exists
         module = db.query(ModuleDB).filter(ModuleDB.id == moduleId).first()
@@ -619,8 +632,7 @@ async def create_file(
             filename=filename,
             title=title,
             fileUrl=fileUrl,
-            iconName=iconName,
-            colorValue=colorValue,
+            grouped=grouped,
             createdAt=datetime.now()
         )
         db.add(new_file)
@@ -634,8 +646,7 @@ async def create_file(
             "filename": new_file.filename,
             "title": new_file.title,
             "fileUrl": new_file.fileUrl,
-            "iconName": new_file.iconName,
-            "colorValue": new_file.colorValue,
+            "grouped": new_file.grouped,
             "createdAt": new_file.createdAt
         }
     except HTTPException:
@@ -647,7 +658,7 @@ async def create_file(
 
 @app.get("/files", response_model=List[dict])
 async def get_all_files(db: Session = Depends(get_db)):
-    """Get all files across all modules"""
+    """Get all files across all modules (iconName and colorValue removed)"""
     try:
         files = db.query(FileDB).all()
         return [
@@ -657,8 +668,7 @@ async def get_all_files(db: Session = Depends(get_db)):
                 "filename": f.filename,
                 "title": f.title,
                 "fileUrl": f.fileUrl,
-                "iconName": f.iconName,
-                "colorValue": f.colorValue,
+                "grouped": f.grouped,
                 "createdAt": f.createdAt
             }
             for f in files
@@ -666,51 +676,10 @@ async def get_all_files(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error fetching files: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-=======
-@app.get("/files", response_model=List[dict])
-async def get_all_files():
-    """Get all files across all modules with grouped field added"""
-    files_response = []
-    for file in files_db:
-        file_copy = file.copy()
-        file_copy["grouped"] = "files"
-        files_response.append(file_copy)
-    return files_response
-
-@app.post(
-    "/files", 
-    status_code=201,
-    summary="Create a new file",
-    description="Create a file by providing moduleId, filename, title, and fileUrl"
-)
-async def create_file(
-    moduleId: int = Form(..., description="ID of the module this file belongs to"),
-    filename: str = Form(..., description="Name of the file"),
-    title: str = Form(..., description="Type of content (Course, TD, or TP)"),
-    Grouped: str = Form("files", description="Group name for the file"),
-    fileUrl: str = Form(..., description="URL where the file is stored")
-):
-    """Create a new file - you provide moduleId, filename, title, fileUrl - server generates ID"""
-    module = next((m for m in modules_db if m["id"] == moduleId), None)
-    if not module:
-        raise HTTPException(status_code=404, detail=f"Module with id {moduleId} not found")
-    
-    new_file = {
-        "id": str(uuid.uuid4()),
-        "moduleId": moduleId,
-        "filename": filename,
-        "title": title,
-        "grouped": grouped,
-        "fileUrl": fileUrl,
-        "createdAt": datetime.now(),
-    }
-    files_db.append(new_file)
-    return new_file
->>>>>>> 44f55b3eb0df07d01b94d8962a4590c099457e99
 
 @app.get("/modules/{module_id}/files", response_model=List[dict])
 async def get_files_by_module(module_id: int, db: Session = Depends(get_db)):
-    """Get all files for a specific module"""
+    """Get all files for a specific module (iconName and colorValue removed)"""
     try:
         files = db.query(FileDB).filter(FileDB.moduleId == module_id).all()
         return [
@@ -720,8 +689,7 @@ async def get_files_by_module(module_id: int, db: Session = Depends(get_db)):
                 "filename": f.filename,
                 "title": f.title,
                 "fileUrl": f.fileUrl,
-                "iconName": f.iconName,
-                "colorValue": f.colorValue,
+                "grouped": f.grouped,
                 "createdAt": f.createdAt
             }
             for f in files
@@ -732,7 +700,7 @@ async def get_files_by_module(module_id: int, db: Session = Depends(get_db)):
 
 @app.get("/modules/{module_id}/titles/{title}/files", response_model=List[dict])
 async def get_files_by_title(module_id: int, title: str, db: Session = Depends(get_db)):
-    """Get files for a specific module and title"""
+    """Get files for a specific module and title (iconName and colorValue removed)"""
     try:
         files = db.query(FileDB).filter(
             FileDB.moduleId == module_id,
@@ -745,8 +713,7 @@ async def get_files_by_title(module_id: int, title: str, db: Session = Depends(g
                 "filename": f.filename,
                 "title": f.title,
                 "fileUrl": f.fileUrl,
-                "iconName": f.iconName,
-                "colorValue": f.colorValue,
+                "grouped": f.grouped,
                 "createdAt": f.createdAt
             }
             for f in files
@@ -757,7 +724,7 @@ async def get_files_by_title(module_id: int, title: str, db: Session = Depends(g
 
 @app.get("/files/{file_id}")
 async def get_file(file_id: str, db: Session = Depends(get_db)):
-    """Get a specific file by ID"""
+    """Get a specific file by ID (iconName and colorValue removed)"""
     try:
         try:
             file_uuid = uuid.UUID(file_id)
@@ -774,8 +741,7 @@ async def get_file(file_id: str, db: Session = Depends(get_db)):
             "filename": file.filename,
             "title": file.title,
             "fileUrl": file.fileUrl,
-            "iconName": file.iconName,
-            "colorValue": file.colorValue,
+            "grouped": file.grouped,
             "createdAt": file.createdAt
         }
     except HTTPException:
@@ -787,16 +753,14 @@ async def get_file(file_id: str, db: Session = Depends(get_db)):
 @app.put("/files/{file_id}")
 async def update_file(
     file_id: str,
-<<<<<<< HEAD
     moduleId: int = Form(...),
     filename: str = Form(...),
     title: str = Form(...),
     fileUrl: str = Form(...),
-    iconName: Optional[str] = Form(None),
-    colorValue: Optional[str] = Form(None),
+    grouped: str = Form("files"),
     db: Session = Depends(get_db)
 ):
-    """Update an existing file"""
+    """Update an existing file (iconName and colorValue removed)"""
     try:
         try:
             file_uuid = uuid.UUID(file_id)
@@ -816,8 +780,7 @@ async def update_file(
         file.filename = filename
         file.title = title
         file.fileUrl = fileUrl
-        file.iconName = iconName
-        file.colorValue = colorValue
+        file.grouped = grouped
         db.commit()
         db.refresh(file)
         logger.info(f"Updated file ID: {file_id}")
@@ -828,8 +791,7 @@ async def update_file(
             "filename": file.filename,
             "title": file.title,
             "fileUrl": file.fileUrl,
-            "iconName": file.iconName,
-            "colorValue": file.colorValue,
+            "grouped": file.grouped,
             "createdAt": file.createdAt
         }
     except HTTPException:
@@ -838,35 +800,6 @@ async def update_file(
         logger.error(f"Error updating file {file_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-=======
-    moduleId: int = Form(..., description="ID of the module this file belongs to"),
-    filename: str = Form(..., description="Name of the file"),
-    title: str = Form(..., description="Type of content (Course, TD, or TP)"),
-    grouped: str = Form("files", description="Group name for the file"),
-    fileUrl: str = Form(..., description="URL where the file is stored")
-):
-    """Update an existing file"""
-    index = next((i for i, f in enumerate(files_db) if f["id"] == file_id), None)
-    if index is None:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    module = next((m for m in modules_db if m["id"] == moduleId), None)
-    if not module:
-        raise HTTPException(status_code=404, detail=f"Module with id {moduleId} not found")
-    
-    updated_file = {
-        "id": file_id,
-        "moduleId": moduleId,
-        "filename": filename,
-        "title": title,
-        "grouped": grouped,
-        "fileUrl": fileUrl,
-        "createdAt": files_db[index]["createdAt"],
-        "grouped": "files"  # Added grouped field to PUT response
-    }
-    files_db[index] = updated_file
-    return updated_file
->>>>>>> 44f55b3eb0df07d01b94d8962a4590c099457e99
 
 @app.delete("/files/{file_id}")
 async def delete_file(file_id: str, db: Session = Depends(get_db)):
