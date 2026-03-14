@@ -297,6 +297,7 @@ async def create_file(
     moduleId: int = Form(..., description="ID of the module this file belongs to"),
     filename: str = Form(..., description="Name of the file"),
     title: str = Form(..., description="Type of content (Course, TD, or TP)"),
+    Grouped: str = Form("files", description="Group name for the file"),
     fileUrl: str = Form(..., description="URL where the file is stored")
 ):
     """Create a new file - you provide moduleId, filename, title, fileUrl - server generates ID"""
@@ -309,9 +310,9 @@ async def create_file(
         "moduleId": moduleId,
         "filename": filename,
         "title": title,
+        "grouped": grouped,
         "fileUrl": fileUrl,
         "createdAt": datetime.now(),
-        "grouped": "files"  # Added grouped field to POST response
     }
     files_db.append(new_file)
     return new_file
@@ -340,6 +341,7 @@ async def update_file(
     moduleId: int = Form(..., description="ID of the module this file belongs to"),
     filename: str = Form(..., description="Name of the file"),
     title: str = Form(..., description="Type of content (Course, TD, or TP)"),
+    grouped: str = Form("files", description="Group name for the file"),
     fileUrl: str = Form(..., description="URL where the file is stored")
 ):
     """Update an existing file"""
@@ -356,6 +358,7 @@ async def update_file(
         "moduleId": moduleId,
         "filename": filename,
         "title": title,
+        "grouped": grouped,
         "fileUrl": fileUrl,
         "createdAt": files_db[index]["createdAt"],
         "grouped": "files"  # Added grouped field to PUT response
