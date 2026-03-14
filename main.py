@@ -279,22 +279,25 @@ async def delete_module(module_id: int):
 # --------- File Endpoints ----------
 @app.get("/files", response_model=List[dict])
 async def get_all_files():
-    """Get all files across all modules"""
-    return files_db
+    """Get all files across all modules with grouped field added"""
+    files_response = []
+    for file in files_db:
+        file_copy = file.copy()
+        file_copy["grouped"] = "files"
+        files_response.append(file_copy)
+    return files_response
 
 @app.post(
     "/files", 
     status_code=201,
     summary="Create a new file",
-    description="Create a file by providing moduleId, filename, title, fileUrl, and optional iconName and colorValue"
+    description="Create a file by providing moduleId, filename, title, and fileUrl"
 )
 async def create_file(
     moduleId: int = Form(..., description="ID of the module this file belongs to"),
     filename: str = Form(..., description="Name of the file"),
     title: str = Form(..., description="Type of content (Course, TD, or TP)"),
-    fileUrl: str = Form(..., description="URL where the file is stored"),
-    iconName: Optional[str] = Form(None, description="Icon name for the file"),
-    colorValue: Optional[str] = Form(None, description="Color value for the file")
+    fileUrl: str = Form(..., description="URL where the file is stored")
 ):
     """Create a new file - you provide moduleId, filename, title, fileUrl - server generates ID"""
     module = next((m for m in modules_db if m["id"] == moduleId), None)
@@ -307,9 +310,8 @@ async def create_file(
         "filename": filename,
         "title": title,
         "fileUrl": fileUrl,
-        "iconName": iconName,
-        "colorValue": colorValue,
-        "createdAt": datetime.now()
+        "createdAt": datetime.now(),
+        "grouped": "files"  # Added grouped field to POST response
     }
     files_db.append(new_file)
     return new_file
@@ -338,9 +340,7 @@ async def update_file(
     moduleId: int = Form(..., description="ID of the module this file belongs to"),
     filename: str = Form(..., description="Name of the file"),
     title: str = Form(..., description="Type of content (Course, TD, or TP)"),
-    fileUrl: str = Form(..., description="URL where the file is stored"),
-    iconName: Optional[str] = Form(None, description="Icon name for the file"),
-    colorValue: Optional[str] = Form(None, description="Color value for the file")
+    fileUrl: str = Form(..., description="URL where the file is stored")
 ):
     """Update an existing file"""
     index = next((i for i, f in enumerate(files_db) if f["id"] == file_id), None)
@@ -357,9 +357,8 @@ async def update_file(
         "filename": filename,
         "title": title,
         "fileUrl": fileUrl,
-        "iconName": iconName,
-        "colorValue": colorValue,
-        "createdAt": files_db[index]["createdAt"]
+        "createdAt": files_db[index]["createdAt"],
+        "grouped": "files"  # Added grouped field to PUT response
     }
     files_db[index] = updated_file
     return updated_file
